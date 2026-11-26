@@ -4,11 +4,12 @@
 
 > ## ⚠️ 新读者读法
 > 
-> 本文档有 45 个章节，混杂了**至少 4 个不同问题**的排查记录。直接从头读会被历史结论带偏。
+> 本文档有 46 个章节，混杂了**至少 4 个不同问题**的排查记录。直接从头读会被历史结论带偏。
 > 
 > **正确读法：**
 > 1. 先读下方「章节有效性对照」，只信标记 ✅ 的章节。
-> 2. **§44**（@ 菜单偶发 1–4 秒延迟，P4 根因）、**§45**（长按 @ 卡顿，P1 机制）是当前有效结论。
+> 2. **§41**（@ 偶发 1–2 秒尖峰，元凶 remote 的 `settings.get`）、**§44**（两类成因的汇总口径）、
+>    **§45**（长按 @ 卡顿机制）是当前有效结论。
 > 3. 其余章节按需查阅，**不要当结论用**。
 > 
 > 历史上的 `HANDOFF.md` / `HANDOFF-*.md` 交接文档已于 2026-11-26 删除：
@@ -18,13 +19,17 @@
 > 
 > | 章节范围 | 状态 |
 > |---|---|
-> | §0 – §40 | **历史**。期间结论多数被后续推翻（§5–§8 是明确的误判记录，§25 推翻了 §24，§41/§43 被 §44 推翻） |
-> | §41 | ❌ **已被 §44 推翻**。曾以为 `settings.get` 是元凶 |
+> | §0 – §40 | **历史**。期间结论多数被后续推翻（§5–§8 是明确的误判记录，§25 推翻了 §24）。§3 的 Rust 方案已于 2026-11-26 移除 |
+> | §41 | ✅ **有效（实测）**。`settings.get` 偶发 1.2 秒尖峰，禁用 remote 后 @ 快 27 倍 |
 > | §42 | ✅ 有效。会话区滚动卡顿与皮肤无关（独立问题，与 @ 无关） |
-> | §43 | ❌ **已被 §44 推翻**。曾以为「空结果不缓存」是元凶 |
-> | **§44** | ✅ **有效**。@ 菜单偶发 1–4 秒延迟（P4）的根因 |
+> | §43 | ⚠️ **部分有效**。源码定位准确；但「空结果不缓存」的修法**未实施**，代码仍是只缓存非空结果 |
+> | **§44** | ✅ **有效（2026-11-26 重写）**。@ 慢的两类成因：请求阻塞（remote）与渲染变重。原「Rust 索引重建」结论已推翻 |
 > | §17 / §23 | ❌ **归类已被 §45 修正**。当时记作「强制布局」，实为**样式重算** |
 > | **§45** | ✅ **有效**。长按 @ 卡顿（P1）的真正机制：光 DOM 样式重算 + 全局 CSS 规则量 |
+> 
+> **两套独立问题，别混为一谈**：
+> - **偶发卡一下**（1–2 秒尖峰）→ §41 请求阻塞，元凶 `ds-harness-remote` 的 `settings.get`
+> - **长按持续卡**（每键几十 ms）→ §45 样式重算，元凶全局 CSS 规则量
 > 
 > ## 当前问题是什么（别和 P1/P2/P3 混淆）
 > 
@@ -33,7 +38,7 @@
 > | P1 | 长按 @ 连续输入卡顿（每键几十 ms） | **无关**，机制见 §45（样式重算 + 全局 CSS 规则量） |
 > | P2 | 删除路径小卡顿 | **无关**，已解决 |
 > | P3 | 会话区滚动偶发卡顿 | **无关**，已查清是首滚一次性布局 |
-> | **P4** | **@ 菜单偶发 1–4 秒延迟** | **← 见 §44** |
+> | **P4** | **@ 菜单偶发 1–4 秒延迟** | **← 见 §41（元凶：remote 的 settings.get）** |
 >
 > ## ⚠️ 时效性声明：文中「better-sidebar 已禁用」的表述已全部失效
 >
@@ -95,7 +100,7 @@
 | # | 阶段 | 我做了什么 | 结论 | 是否正确 |
 |---|---|---|---|---|
 | 1 | 建插件 | 包装 `candidates`，零请求本地快照替代 | 首屏 1962–2680ms → 226ms | ✅ 成立 |
-| 2 | Rust 会话候选 | Rust 扫磁盘按 mtime 排序取 20 条 | 功能可用，但解析性能只比 JS 快 10% | ✅ 成立（但收益小） |
+| 2 | Rust 会话候选 | Rust 扫磁盘按 mtime 排序取 20 条 | 功能可用，但解析性能只比 JS 快 10% | ~~✅ 成立~~ **已移除，见 §3 后续说明** |
 | 3 | 用户报「按住 @ 卡」 | 改为测连续输入而非首屏 | 找到「每次击键一个长任务」 | ✅ 方向正确 |
 | 4 | 误判 A | 认为 116ms 是 DSH 固定成本 | 被真实键盘对照推翻（`@` 220ms vs `x` 129ms） | ❌ 已推翻 |
 | 5 | 误判 B | 认为 78% 是 `measure()` 的 74 次 gBCR | 被「假值实验」推翻（142ms → 142ms） | ❌ 已推翻 |
@@ -128,6 +133,9 @@
 **做法**：Rust 二进制扫 `~/.dsh/sessions`，按文件 mtime 排序，取最新 20 条。
 
 **结果**：功能可用。但后面 §5 的对比显示 **Rust 96.76ms vs JS worker 106.34ms，只快 10%**，在噪声内。
+
+**后续（2026-11-26）**：Rust 已**整体移除**，改回纯 JS（`node:zlib` 进程内解压 zstd）。
+本节保留为历史记录，其结论不再适用于当前实现。
 
 **教训**：性能归因没做之前，不要先优化「看起来慢」的部分。
 
@@ -2979,7 +2987,12 @@ ds-harness-remote/devices       →    8.5 ms   ← 正常
 
 ---
 
-## 43. settings.get 慢的真正根因：remote 的 @ 源 + fast-at 空结果不缓存（2026-11-25 定案）
+## 43. settings.get 的来源：remote 的 @ 源 + fast-at 空结果不缓存（2026-11-25）
+
+> ⚠️ 本节标题原含「真正根因」「定案」。2026-11-26 复核：remote 的 @ 源定位**准确**；
+> 但本节的修法（空结果也缓存，`EMPTY_TTL_MS = 800`）**从未实施**——
+> `lib/client.js:626` 现在仍是 `if (fileItems.length > 0 && ...)`，全文无 `EMPTY_TTL_MS`。
+> 「空结果不缓存」是否为主因，见 §44 的分歧记录。
 
 ### 用户诉求
 
@@ -3070,7 +3083,10 @@ if (fileItems.length > 0 && (signal === undefined || !signal.aborted)) {
 
 ### 可执行的修法
 
-**方案 A（推荐，改我们自己的 fast-at）：空结果也缓存，用短 TTL**
+**方案 A（曾提议，⚠️ 未实施）：空结果也缓存，用短 TTL**
+
+> 2026-11-26 核实：`lib/client.js:626` 仍是 `if (fileItems.length > 0 && ...)`，
+> 全文无 `EMPTY_TTL_MS`。下面只是当时的提议代码，**不在当前实现里**。
 
 ```js
 const EMPTY_TTL_MS = 800
@@ -3102,156 +3118,99 @@ if (signal === undefined || !signal.aborted) {
 
 ---
 
-## 44. 定案：@ 慢的唯一根因是 fast-at 的 Rust 索引重建窗口（2026-11-25）
+## 44. @ 慢的两类成因：请求阻塞（remote）与索引重建 —— 口径已统一（2026-11-26 修订）
 
-### 用户质疑
+> ⚠️ 本节原标题为「定案：@ 慢的唯一根因是 fast-at 的 Rust 索引重建窗口」。
+> 2026-11-26 复核发现该结论**建立在一份已删除的实现上**，现按实测证据重写。
 
-> 「需要你继续挖，你这个结论依旧很模糊，什么叫做同一时刻发出有一个同步任务把他们卡住。」
->「你必须要清清楚楚地说明白，为什么他们同时出发，然后完成任务的总时间大于他们串行出发的任务时间之和」
+### 为什么推翻原结论
 
-前面几轮给出的解释都是错的，这一节是定案。
+原结论的因果链依赖 `execFile` 启动 Rust 二进制扫 396 个 `.zstd`。
+但当前代码里 **Rust 已完全移除**：
 
-### 结论（一句话）
-
-**`settings.get` 和 `fileReferences/list` 从来没有「同时触发」。它们串行排队在 fast-at 的索引请求后面，
-而那个索引请求在命中 `INDEX_TTL_MS = 30_000` 过期时，会 spawn 一个 Rust 子进程扫 396 个 `.zstd` 文件（282.1 MB）。
-慢的是这第三个请求，不是那两个。**
-
-### 证据一：请求的 send / done 绝对时间戳
-
-```
-【索引刚过期 · 第 1 次 @】1379.6ms
-   fastAt.send  @80.7
-   fastAt.done  @1311      ← 1230ms 全在这里
-   fileRef.send @1313.3    ← 索引结束后才发出
-   fileRef.done @1315.2    ← 实际只用 1.9ms
-
-【同一索引周期内 · 第 2 次 @】156ms
-   fastAt.send  @53.4
-   fastAt.done  @105.3     ← 52ms
-   fileRef.done @110.2     ← 实际只用 2.1ms
-```
-
-**`fileReferences` 的「耗时 2 秒」是误读**：它是在 2 秒后才被**调用**，不是执行了 2 秒。
-
-### 证据二：慢请求全部在同一刻释放
-
-```
-send@0.1     → done@1042.6   1042ms  ← 撞上重建
-send@202.7   → done@1049.2    846ms  ← 与上一条同一刻释放
-send@1261.3  → done@1265.7      4ms  ← 重建完成，立刻恢复
-send@1475.8  → done@1480.2      4ms
-send@1694.1  → done@1697.7      4ms   (stale=false)
-...
-send@2781.2  → done@2991.5    210ms  ← 又一次重建开始
-```
-
-1042.6 与 1049.2 两个慢响应**同一刻结束**，其余全部 4ms。
-这是「单一不可中断的任务占住资源」的确定特征，不是并发劣化。
-
-### 证据三：浏览器主线程全程流畅
-
-```
-帧数 152，最大帧 17.9ms，>100ms 帧 0，longtask 0 条
-但同一时段 fetch 耗时 2508ms
-```
-
-**浏览器完全没卡，卡的是 HTTP 响应回来的时间**。阻塞不在前端。
-
-### 证据四：Rust 二进制自身耗时方差 4 倍
-
-```
-直接执行 fast-at-sessions.exe：
-  第1次: 3,942 ms   输出 133,840 字符
-  第2次:   824 ms
-  第3次:   910 ms
-  第4次: 1,138 ms
-
-execFile 异步跑三次：
-  async#1:  909 ms
-  async#2: 3635 ms
-  async#3: 3683 ms
-```
-
-同一二进制、同参数，909ms 到 3942ms 波动 4 倍 ⇒ 瓶颈是磁盘 I/O 不是 CPU。
-
-目录规模实测：396 个 `.zstd` 文件，共 **282.1 MB**，SSD（SSSTC CA5-8D512-Q79）。
-每次全量重建都要把这些文件的头部读一遍。
-
-### 精确因果链
-
-```
-用户按下 @
-  └─ InputTriggerController.fetchCandidates
-      ├─ fast-at 包装的 candidates → computeCandidates()
-      │   ├─ await indexPathCandidates()            ← ① 串行等待点
-      │   │   └─ fetch('/fast-at/api/sessions.list')
-      │   │       └─ sessions-reader.query()
-      │   │           ├─ 索引新鲜(≤30s) → 3.5–7.5ms 返回
-      │   │           └─ 索引过期(>30s) → ensureIndex()
-      │   │               └─ execFile(fast-at-sessions.exe)   ← ★ 阻塞源
-      │   │                   └─ 扫 396 个 .zstd / 282.1MB = 824–3942ms
-      │   └─ await fetchFileItems()  ← ② 索引返回后才执行，实测 2ms
-      └─ remote 源 candidates
-          └─ await control('settings.get')  ← ③ 也排在 ① 后面，实测 0.1–1ms
-```
-
-**总耗时 ≈ fast-at 索引重建耗时**，远大于 `settings.get`(1ms) + `fileReferences`(2ms) 之和——
-因为那两个根本没跟索引并行，它们在排队。
-
-### 为什么表现为「偶发卡一下」
-
-`INDEX_TTL_MS = 30_000`。索引 30 秒过期后，**下一次** @ 必然撞上重建（824–3942ms），
-之后再按都是 4ms 左右，直到再过 30 秒。
-
-### 被推翻的旧结论
-
-| 旧结论 | 推翻依据 |
+| 核查项 | 结果 |
 |---|---|
-| `settings.get` 里 ACP 探测走 `where` 同步子进程导致慢 | 实测 `acp.backends` 为空，该段从未执行；安静态 `settings.get` 只要 0.1–1ms |
-| `fileReferences/list` 本身慢 | 实测 1.7–2.1ms，返回 `{ok:true,value:[]}` |
-| 两者并发互相阻塞 | 两者**没有重叠**，`fileRef.send` 永远在 `fastAt.done` 之后 |
-| 有个「同步任务」卡住 | 含混。现已定位到具体进程：`execFile` 启动的 `fast-at-sessions.exe` |
-| 空结果不缓存导致重发 | `fileReferences` 确实每轮重发，但只占 2ms，不是瓶颈 |
+| `dsh-fast-at/` 目录下的 `.exe` | **不存在**（只有 lib/ 下的三个 .js） |
+| `sessions-reader.js` 是否 `execFile`/`spawn` | **无**。改用 `node:zlib` 进程内解压 |
+| `ensureIndex()` 是否阻塞读取 | **不阻塞**：`if (stale) void ensureIndex(self)`，本次仍用旧索引返回 |
+| 索引未就绪时 | 返回 `{ ok:false, code:'index-warming' }`，不等待 |
 
-### 修复建议（按性价比排序）
-
-**1. 把重建移出请求路径（改动最小）**
+`sessions-reader.js:139-147` 的现状：
 
 ```js
-// sessions-reader.js：现在
-const age = Date.now() - index.at
+if (index === undefined) {
+  // 注意这里**不 await 重建**——重建要 490–600ms，不能让 @ 等它。
+  if (loadFromCache() === false) void ensureIndex()
+  return { ok: false, code: 'index-warming', message: '会话索引正在后台构建' }
+}
 const stale = age >= INDEX_TTL_MS
-if (stale) ensureIndex()   // 不 await，但仍会 spawn 子进程抢 I/O
-
-// 改法：定时后台重建，请求路径只读内存
-setInterval(() => { if (Date.now() - (index?.at ?? 0) >= INDEX_TTL_MS) ensureIndex() }, 5000)
-// query() 里删掉 if (stale) ensureIndex()，只标记 stale:true
+if (stale) void ensureIndex(self)   // void：不阻塞本次查询
 ```
 
-**2. 增量索引（治本）**
+**因此「@ 被 Rust 索引重建卡住」在现在的代码里不可能发生。** 原 §44 的修复建议
+（增量索引、缩小 Rust 输出、`--limit 20`）也随之失效，已删除。
 
-Rust 侧记录每个会话文件的 mtime，下次只读变化的。396 个里通常只有 1–2 个会变，
-能把 824–3942ms 降到 10ms 量级。
+### 统一后的口径：两类成因，互不排斥
 
-**3. 缩小 Rust 输出体积**
+| 类别 | 成因 | 特征 | 证据 |
+|---|---|---|---|
+| **A. 请求阻塞** | `ds-harness-remote` 的 `@` 源里 `await control('settings.get')` | 偶发 1.2s 尖峰；中位数正常 | §41 实测：启用 1319ms / 禁用 47.8ms，**快 27 倍** |
+| **B. 渲染变重** | 全局 CSS 规则量大，长按 @ 时每键触发样式重算 | 每键持续 +几十 ms，中位数即可看出 | §45 实测：真实按键 20 次，启用 3250/3356ms vs 禁用 950/972ms |
 
-现在每次输出 133,840 字符（全量 396 条元数据），一次 @ 只用 20 条。
-改成 Rust 侧 `--limit 20` 截断。
+两者**独立**，分别对应「偶发卡一下」与「长按很卡」两种不同体感。
 
-**4. 并行化 computeCandidates（治标但便宜）**
+### 关于 `settings.get` 的两说并存（保留分歧，不强行裁决）
+
+本文件曾出现两个互斥判断，如实记录：
+
+| 出处 | 判断 | 当时的证据 |
+|---|---|---|
+| §41（实测） | `settings.get` 是元凶 | fetch tap 抓到 1270.6ms，且禁用 remote 后 @ 从 1319ms 降到 47.8ms |
+| §44（原） | `settings.get` 只占 0.1–1ms，非元凶 | 单次时间轴显示它排在 fast-at 索引之后 |
+
+**倾向 §41 的理由**：§41 有 A/B 对照（禁用后快 27 倍），§44 原判断只有单次时间轴且依赖已删除的实现。
+但截至本次修订**未重新实测**，故不写成定论。
+
+### 源码位置（已复核）
+
+`ds-harness-remote/dist/client.js:7924-7927`：
 
 ```js
-// 现在：会话候选 await 完才发文件候选
-const sessionItems = await indexPathCandidates(...)
-fileItems = await fetchFileItems(...)
-
-// 改法：并行
-const [sessionItems, fileItems] = await Promise.all([
-  indexPathCandidates(...),
-  fetchFileItems(...),
-])
+candidates: async (_session, request) => {
+  if ((await control("settings.get").catch(() => {}))?.config?.remoteTools?.enabled === false) return []
+  let devices = await control("devices").catch(() => [])
+  ...
+}
 ```
+
+**关键陷阱：判断顺序**。先 `await settings.get`，拿到结果后才看开关。
+所以把 `remoteTools.enabled` 设为 `false` **只能省掉 devices 这一次请求，省不掉 `settings.get` 本身**。
+
+### 已排除的错误方向（保留，避免重走）
+
+| 假设 | 排除依据 |
+|---|---|
+| `settings.get` 里 ACP 探测走 `where` 同步子进程 | 本机 `acp.backends` 为空，该段从未执行 |
+| `fileReferences/list` 本身慢 | 实测 1.7–2.1ms |
+| 两者并发互相阻塞 | 两者没有重叠，`fileRef.send` 总是在前一个 done 之后 |
+| 空结果不缓存导致重发 | `fileReferences` 确实每轮重发，但只占 2ms |
+| Rust 索引重建窗口 | **Rust 已移除**，且 `ensureIndex` 为 `void` 非阻塞 |
+
+### 可选规避路径（未实施，仅记录）
+
+`ui-input-trigger` 的 `registerSource` 返回卸载函数，且 `live.sources` 是普通数组：
+
+```js
+registerSource(src) {
+  ...
+  live.sources.push(src)
+  return () => { live.sources.splice(live.sources.indexOf(src), 1); ... }
+}
+```
+
+理论上可在 fast-at 里于运行时移除 `{ trigger:'@', name:'主机' }` 这个源。
+**风险**：依赖压缩后的内部结构（`live.sources`），DSH 升级可能改名；且注册时序不确定。
+`inputTriggers` 没有公开的「按名字注销他人 source」API。
 
 ### 方法学教训（第 25 条）
 
@@ -3261,7 +3220,10 @@ const [sessionItems, fileItems] = await Promise.all([
 
 判据：若慢的请求全部在同一刻 done，且 send 时刻互不相同
   ⇒ 不存在交互，它们只是在排队等同一个更早的任务。
-找到那个「更早的任务」就是根因。本案是 fast-at 索引重建（execFile 子进程）。
+
+但「找到更早的任务」还要求证它**现在仍存在**：
+本案的根因（Rust execFile）在结论写下后被删除，结论却继续被引用。
+写结论时把依赖的实现一并写清；复核时先确认那段实现还在。
 ```
 
 ## 45. 长按 @ 卡顿的真正机制：不是布局重算，是光 DOM 的样式重算（2026-11-26）
