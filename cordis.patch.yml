@@ -1,0 +1,7 @@
+# dsh bundle patch：把「@ 引用候选提速」插件插入 profile 的配置层栈
+#
+# 本插件的全部行为都在浏览器半（lib/client.js）：host 半只是 cordis 配置行能加载的
+# 模块入口，不新建、不修改宿主的任何服务。第一版没有配置项。
+- insert:
+    - id: fast-at
+      name: 'dsh-fast-at'

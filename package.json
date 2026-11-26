@@ -1,0 +1,44 @@
+{
+  "name": "dsh-fast-at",
+  "version": "0.2.0",
+  "description": "去掉 @ 引用候选的 2 秒等待：会话候选改由本地会话索引提供（纯 JS，按会话文件修改时间取最新 20 条），失败回退客户端快照；文件候选由插件自取以保持原生语义",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "web",
+    "input-trigger",
+    "reference",
+    "performance"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./sessions-reader": "./lib/sessions-reader.js"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}

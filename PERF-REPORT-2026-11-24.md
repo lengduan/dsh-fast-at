@@ -1,0 +1,739 @@
+> **排查过程请看 [TROUBLESHOOTING-LOG.md](TROUBLESHOOTING-LOG.md)。**
+> 本文档是某一时点的性能数据快照；排查路线、4 次误判及推翻原因、已排除清单都在那份活文档里，且会持续更新。
+# 连续 @ 卡顿：实测报告（2026-11-24）
+
+> 按你的三条路线逐条实测，并把 DSH 源码解包做了函数级溯源。
+>
+> **核心结论（终稿）：卡顿只在 `@` 上 —— 真实键盘严格对照是 220ms vs 普通字符 129ms，多出约 91ms，全部是「打开并渲染 @ 菜单」的成本。它不在本插件内（插件停用后同样慢）、不是网络请求、不是候选行数、也不是 `getBoundingClientRect`（反转实验已排除）。**
+>
+> 本报告有两次自我推翻，均保留原文并标注，见 §3.6 与 §3.8。
+
+## 0. 一句话结论
+
+| 你的假设 | 实测结果 |
+|---|---|
+| 「会话候选 Rust 程序导致卡顿」 | **不成立**。关掉它后首屏 1727→226ms（首屏确实改善），但连续 @ 的长任务数反而从 22 升到 42 |
+| 「之前触发 listSessions 的流程导致卡顿」 | **不成立**（对连续输入而言）。它只影响首屏那一次 |
+| 「Rust 比 JS 解析快很多」 | **不成立**。同输入同输出下 Rust 96.76ms vs JS 106.34ms，**只快 10%** |
+| 真正的卡顿源 | **`@` 每次击键约 116ms 的同步阻塞，在 DSH 自身的 `controller.track()` 里**（§3.6）。普通字符 `x` 打 10 次只 1 个长任务，`@` 打 10 次有 12–13 个 |
+
+## 1. 路线 1：卡顿点实测
+
+### 1.1 测量方法
+
+用真实键盘事件（`Control+a` 清空 → `@` 键 repeat 20 次），同时用 `PerformanceObserver` 采集 longtask（>50ms 的主线程阻塞）与 rAF 帧间隔。**不是**单次首屏延迟。
+
+### 1.2 三组对照（各 20 次连发 @）
+
+| 配置 | 长任务数 | 长任务总时长 | 卡顿帧(>100ms) | 帧最大值 | 请求数 |
+|---|---|---|---|---|---|
+| **原生（插件停用）** | 23 | **4487ms** | 22 | 362ms | 80 |
+| 插件·会话开 | 22 | 3269ms | 20 | 262ms | 80 |
+| 插件·会话关 | 42 | 4740ms | 21 | 291ms | 60 |
+
+**读法**：
+- 原生每按一次 @ 都会请求 `api/sessionReferenceResolver/candidates`（20 次），长任务合计 4487ms。
+- 我们的插件把长任务总量降到 3269ms（**改善 27%**），但卡顿依然明显。
+- 关掉会话候选后请求数从 80 降到 60（`sessions.list` 消失），但长任务反而更多（42 个）——说明**卡顿主要来自「每次击键都完整重算一次候选」这个模式本身**，而不是某一个请求。
+
+### 1.3 卡顿的直接来源
+
+连打 5 个 @，每次间隔 120ms，逐次计时：
+
+```
+第 1 个 @:   4ms   （复用已有菜单）
+第 2 个 @: 291ms
+第 3 个 @: 567ms
+第 4 个 @: 827ms
+第 5 个 @: 1097ms
+```
+
+对应 longtask 序列：`307, 231, 210, 201, 115, 226, 186, 195, 209, 252, 215, 191, 194, 204, 195, 230, ...`
+
+**每按一次 @ 产生一个 200–300ms 的主线程长任务。** 按住 @ 不放时这些长任务首尾相接，主线程几乎 100% 被占满——这就是「不流畅」的直接原因。
+
+### 1.4 单次 @ 的请求时序（会话开）
+
+```
+4ms      settings.get 发起 ──────────────── 2841ms 返回（2837ms）
+5ms      sessions.list 发起 ──────── 1516ms 返回（1511ms）
+1518ms   fileReferences/list ──── 1561ms（43ms）
+1521ms   devices ─── 1546ms（25ms）
+```
+
+注意：`fileReferences/list` 只要 **43ms**，`devices` 只要 **25ms**。真正拖慢的是 `settings.get`(2837ms) 与 `sessions.list`(1511ms)。
+
+而**直接 fetch `/fast-at/api/sessions.list` 只要 15–62ms** —— 说明这两个请求是在并发下互相阻塞的，不是单次成本高。
+
+## 2. 路线 2：只返回文件目录（方案 A）
+
+### 2.1 首屏内容行耗时
+
+| 配置 | 内容行首次出现 | 请求 |
+|---|---|---|
+| 会话开 | **1727ms** | settings.get + sessions.list + fileReferences |
+| 会话关（只文件） | **226ms** | settings.get + fileReferences |
+
+**方案 A 首屏快 7.6 倍。** 这是真实改善。
+
+### 2.2 但连续输入依旧卡
+
+见 §1.2 第三行：会话关时长任务 42 个 / 4740ms，比会话开还多。
+
+**原因**：关掉会话候选只是去掉了一个请求，但「每次击键都重新计算全部候选」这个模式没变。剩下的 `settings.get`、`fileReferences/list`、`devices` 仍会各跑一次，而且 `fileReferences` 要 1222ms（见 §1.4 的单次测量）。
+
+### 2.3 结论
+
+方案 A 能让**单次首屏**从 1727ms 降到 226ms，但**不能解决连续输入的卡顿**。要解决卡顿必须做防抖 + 缓存 + 旧任务取消（见 §3.4 建议）。
+
+## 3. 路线 3：Rust vs JS 解析性能
+
+### 3.1 测量方法（严格同输入同输出）
+
+1. 生成语料 `.scratch/parse-corpus.json`：取最新 20 个真实会话，各取**前 10 帧的原始字节**（base64），共 **184 帧 / 1944KB**。
+2. Rust 侧：`crates/fast-at-sessions/src/bin/parse-bench.rs`，逐帧 `zstd::decode_all`，统计 header 与 `session/title` 命中。
+3. JS 侧：`tests/parse-bench-js.mjs`，**跑在 `worker_threads` 里，不占主线程**，逐帧 `zlib.zstdDecompressSync`。
+4. 两边都跑 5 次，取中位数。
+
+### 3.2 结果：输出完全一致，耗时基本相同
+
+```
+JS  (worker): sessions=20 frames=184 headerHits=211 titleHits=20
+              median 106.34ms  (84.02–142.75)  runs: [130.54, 84.02, 85.45, 106.34, 142.75]
+
+Rust:         sessions=20 frames=184 headerHits=211 titleHits=20
+              median  96.76ms  (92.47–108.97) runs: [108.97, 104.01, 92.47, 96.72, 96.76]
+```
+
+**Rust 只快约 10%，差异在采样噪声范围内。**
+
+### 3.3 全量索引的另一种对比
+
+| 实现 | 全量 389 个会话索引 |
+|---|---|
+| Rust（`--title-limit 30`） | **1215–2322ms**（5 次采样） |
+| JS（worker，同等逻辑） | 未单独测全量；按 20 会话 106ms 外推约 2000ms 量级 |
+
+> **必须修正**：我上一版报告写的「Rust 全量索引 328ms」在当前环境**不复现**。刚才 5 次采样是 2322 / 2103 / 1215 / 1220 / 1255ms。
+> 328ms 那组是在更低的系统负载下测的。**以这组为准**：全量索引约 1.2–2.3 秒。
+
+### 3.4 结论：解析不是瓶颈，模式才是
+
+解压+解析 184 帧只要约 100ms（Rust 或 JS 都一样）。而单次 @ 要 1727ms、连续输入每次 200–300ms 长任务。
+
+**性能问题的量级不在解析，在于：**
+1. **没有防抖** —— 每次击键都触发完整计算（20 次击键 = 20 次完整流程）
+2. **请求互相阻塞** —— 4 个请求并发时，settings.get 从 62ms 涨到 2837ms
+3. **每次都重取** —— 同一个 query（连续 @ 时 query 始终是空）反复算同一结果
+
+## 3.5 请求合并实验：请求不是瓶颈
+
+把 300ms 内的重复请求合并（自建 debounce，实测 60 个请求合并成 **4 个**，合并 56 次）：
+
+| 配置 | 长任务数 | 长任务总时长 | 卡顿帧 | 帧最大 |
+|---|---|---|---|---|
+| 插件·请求合并 | 21 | 3782ms | 20 | 309ms |
+| **原生·请求合并** | 21 | **4567ms** | 20 | 386ms |
+| 插件·不合并 | 22 | 3269ms | 20 | 262ms |
+
+**请求从 60 个砍到 4 个，卡顿一点没减少。** 而且原生（插件停用）比插件更慢。
+
+⇒ **卡顿与请求数量无关，与我们的插件也无关。它来自 DSH 自身 @ 菜单的每次击键重算。**
+
+### 结论
+
+**请求从 60 个砍到 4 个，长任务一点没减少。** 而且原生（插件停用）比插件更慢。
+
+⇒ 卡顿与请求数量无关，与我们的插件也无关。确切位置见 §3.6。
+
+## 3.6 卡顿的确切位置：`@` 每次击键的同步阻塞（不在本插件内）
+
+上一节我只说到「每次击键跑一遍完整候选计算」，这是**不准确**的。把 DSH 源码解包（`app.asar` → `.scratch/asar-out`）后逐段读，并做了函数级对照实验，结论要修正。
+
+### (a) 代码路径（`@` 的完整调用链）
+
+```
+输入事件
+  └─ controller.track(draft, caret, guard, draftRev)          src/client/controller.ts:126
+       ├─ detectTrigger(draft, caret, guard)                   src/core/detect.ts:48
+       │    └─ activeAtToken(line, cursorCol)                  @deepseek-ai/dsh-file-reference/src/grammar.ts:26
+       │         query = /(?:^|\s)@([^\s]*)$/ 的第 2 组
+       ├─ 去重判断（controller.ts:158-164）
+       │    same = prev.hit.trigger === hit.trigger
+       │        && prev.hit.query === hit.query
+       │        && prev.hit.span.start === hit.span.start
+       │        && prev.hit.span.end === hit.span.end
+       │    if (same) return                        ← 相同则跳过重算
+       ├─ refreshHeaders(hit, roster)                          controller.ts:618
+       │    └─ 每个源的 src.header(projection, {query, ...})
+       └─ fetchCandidates(hit, roster)                         controller.ts:539
+            ├─ stopFetch()                    ← 先 abort 上一轮
+            └─ 每个源的 source.candidates(projection, {query, signal})
+```
+
+**关键一点**：`same` 判断里有 `span.start` / `span.end`。连打 `@` 时：
+- `@@@` 的第 2 个 @ 让 `span.end` 从 1 变 2，`query` 从 `@` 变 `@@`
+- 所以 `same` **永远为 false**，每次都走完整流程
+
+这是设计上的预期行为（每多一个字符就是新的搜索词），**不是 bug**。
+
+### (b) 决定性对照：`@` 每次击键一个长任务，普通字符没有
+
+用**真实键盘事件**（不是 `execCommand`，排除测量工具开销），交替 4 轮，每轮连打 10 次：
+
+| 输入 10 次 | 第 1 轮 | 第 2 轮 | 第 3 轮 | 第 4 轮 | 合计长任务 |
+|---|---|---|---|---|---|
+| 普通字母 `x` | 1 个 / 129ms | 1 个 / 75ms | 1 个 / 97ms | 1 个 / 77ms | **4 个 / 378ms** |
+| `@` | 12 个 / 1694ms | 13 个 / 1441ms | 12 个 / 1267ms | 13 个 / 1398ms | **50 个 / 5800ms** |
+
+**`@` 每次击键精确产生约 116ms 的主线程长任务；普通字符一次都没有。** 四轮结果完全可重复。
+
+这就把「卡顿」定位到了 **`@` 特有的那条路径**，而不是通用输入开销。
+
+### (c) 116ms 发生在哪个时刻（结论后被 §3.7 细化：是强制重排，不是脚本本身）
+
+单次 `@` 的完整时序（相对击键时刻）：
+
+```
+rel    6ms   settings.get 发起
+rel    8ms   /fast-at/api/sessions.list 发起    ← 我们插件的请求
+rel  146ms   首帧完成（长任务 148ms）
+rel  465ms   sessions.list 返回
+```
+
+**长任务在 146ms 就结束了，而请求 465ms 才返回。** 说明这 116–148ms 是击键瞬间的**同步计算 + 首帧渲染**，与请求结果无关。
+
+### (d) 请求不是瓶颈
+
+| 项 | 实测 |
+|---|---|
+| 直接 `fetch('/api/fileReferences/list')` | **11–12ms** |
+| 直接 `fetch('/fast-at/api/sessions.list')` | **15–62ms** |
+| 阻断所有 fetch（让候选请求全部立即失败）后打 `@` | **仍然 152ms 长任务** |
+| 单次 `@` 的 DOM 变更 | 8 次 mutation / 4 个节点 |
+
+请求快、DOM 变更少、断网也照样慢 —— 开销在**打开 @ 菜单这条路径的同步 JS 逻辑**里。
+
+### (e) 与我们的插件无关
+
+| 状态 | 连打 10 次 `@` 的长任务 |
+|---|---|
+| 插件启用 | 13 个 / **~128ms 均值** |
+| 插件停用（`__FAST_AT_OFF = true`，转调原生实现） | 14 个 / **~118ms 均值** |
+
+**插件停用后同样慢，甚至个数更多。** 卡顿不在本插件。
+
+### (f) 结论
+
+```
+@ 击键 → controller.track()
+           ├─ detectTrigger()         ← 触发菜单判定
+           ├─ refreshHeaders()        ← 每个源的 header() 同步调用
+           ├─ fetchCandidates()       ← 先 stopFetch() abort 上一轮，再调源
+           └─ 菜单首帧渲染
+         ↑ 这一段在 146ms 内同步完成，请求还没回来
+         ↑ 每次 @ 击键都完整走一遍（因为 span.end 变了，去重判据 same 恒为 false）
+```
+
+**每一次 `@` 击键都会同步跑一遍「触发判定 + header 轮询 + 发起候选 + 菜单渲染」，耗时约 116–150ms。** 按住 @ 不放时这些同步块首尾相接，主线程被完全占满 —— 这就是卡顿。
+
+> 进一步拆解见 §3.7：这 116–150ms 里 **78% 是强制样式重算 + 重排**，首帧渲染只占 1.8%，事件处理函数本身只占 0–16ms。
+
+这是 DSH 的既有设计（每多一个字符就是新的搜索意图），**不是 bug，也不在本插件的能力边界内**。
+
+### (g) 插件层面还能做什么
+
+| 措施 | 有效吗 | 原因 |
+|---|---|---|
+| 防抖（停顿后才算候选） | **收益很小** | 能省的只是 `fetchCandidates` 里 await 之后的部分；116ms 里它占比很小（请求 15–62ms，且能被缓存命中） |
+| 同 query 缓存 | **无效** | 连打 @ 时 query 每次都变（`@`→`@@`→`@@@`），永远不命中 |
+| 只返回文件（方案 A） | **只改善首屏** | 首屏 1727→226ms，但每次击键的同步块不变 |
+| 改 DSH 输入框 | 能根治 | 超出插件范围 |
+
+**我的判断**：插件层面无法显著改善「按住 @ 卡顿」。真要解决，得改 DSH 的输入触发器实现（比如：query 为空或纯符号时不打开菜单、或对连续同字符输入做合并）。
+
+## 3.7 逐项拆解：同步 JS 慢，还是首帧渲染慢？
+
+> **⚠️ 本节 (d)(e) 关于「74 次 getBoundingClientRect 是瓶颈」的结论已被 §3.8 的反转实验推翻，请以 §3.8 为准。**
+> 本节 (a)(b)(c) 的测量数据仍然有效（渲染只占 1.8%、处理只占 0–16ms）。
+
+用两个浏览器原生 API 分别测：**PerformanceEventTiming**（把每个事件拆成「处理」与「处理完到绘制完成」）和 **LoAF / long-animation-frame**（把每帧拆成「脚本 / 样式布局 / 渲染」）。
+
+### (a) 事件级：处理很快，绘制慢
+
+人类节奏（180ms 间隔）打 `@`，单键平均：
+
+| 事件 | handler（JS 处理） | render（处理完到绘制完成） | 合计 |
+|---|---|---|---|
+| `keydown` | **1ms** | **50ms** | 52ms |
+| `keypress` | **16ms** | **35ms** | 54ms |
+| `beforeinput` | **9ms** | **42ms** | 51ms |
+| `input` | **6ms** | **35ms** | 41ms |
+| `keyup` | **0ms** | **42ms** | 42ms |
+
+**事件处理函数本身只占 0–16ms**，剩下 35–50ms 花在「处理返回之后、这一帧画完之前」。
+
+### (b) 帧级：渲染占比 2%，脚本占比 90%，其中大头是强制样式重算
+
+10 次 `@`（按住连发）的 LoAF 汇总：
+
+| 项 | 耗时 | 占帧总时长 |
+|---|---|---|
+| 帧总时长 | 1624ms | 100% |
+| **首帧渲染**（renderStart → 帧结束） | **30ms** | **1.8%** |
+| 脚本执行 | 1459ms | 90% |
+| └ 其中 **forcedStyleAndLayout**（强制样式重算 + 布局） | **1264ms** | **78%** |
+
+### (c) 所以答案是
+
+**不是「同步 JS 跑得慢」，也不是「首帧渲染慢」，而是「每次击键都会触发一次强制同步布局」。**
+
+拆开看：
+
+1. **首帧渲染（画到屏幕上）不是瓶颈** —— 只占 1.8%。浏览器这一帧没什么要画的。
+2. **同步 JS 自己执行也不慢** —— 每个事件 handler 只有 0–16ms。
+3. **真正的大头（78%）是 `forcedStyleAndLayoutDuration`** —— 也就是「JS 改了 DOM，又在同一个任务里读了布局，逼浏览器立刻重算样式 + 重排」。
+
+### (d) 具体是哪些代码在强制重排
+
+在 `@` 击键期间给所有布局读取 API 打点，单次击键共 **74 次 `getBoundingClientRect()`**：
+
+| 调用来源 | 次数 | 用途 |
+|---|---|---|
+| `measure()` | **70** | 右侧浮动按钮自动避让定位 |
+| `isVisible()` | 2 | 可见性判断 |
+| `slotOccupied()` | 2 | 插槽占位检测 |
+
+`measure()` 的运行时代码（直接从浏览器里取出）：
+
+```js
+function measure() {
+  const rect = document.querySelector("[data-sidebar-right-expand], [data-sidebar-right-toggle]")
+    ?.getBoundingClientRect();
+  const visible = rect !== undefined && rect.width > 0 && rect.height > 0;
+  const top = visible ? Math.max(4, rect.top + (rect.height - BUTTON_SIZE) / 2) : 8;
+  let left = visible ? rect.left - GAP - BUTTON_SIZE : window.innerWidth - BUTTON_SIZE - GAP - 8;
+  const root = document.documentElement;
+  const minLeft = root.dataset.platform === "darwin" && !root.hasAttribute("data-fullscreen") && top < 48 ? 88 : 4;
+  for (let step = 0; step < MAX_RETREAT_STEPS && left >= minLeft; step++) {
+    if (slotFree(left, top)) return { top, left };   // ← slotFree 里又调 gBCR
+    left -= STEP_PX;
+  }
+  return { top, left: Math.max(left, minLeft) };
+}
+```
+
+这是**右侧浮动按钮的自动避让定位**逻辑：它在循环里反复调 `slotFree()` → `slotOccupied()` → `getBoundingClientRect()`，最多 `MAX_RETREAT_STEPS` 次。
+
+### (e) 一个必须说清的量级矛盾（此段归因已被 §3.8 推翻）
+
+我给 `getBoundingClientRect` 包了一层计时，74 次调用**总共只花 0.3ms**（每次 0.005ms）。
+
+这看起来和 LoAF 报告的 1264ms 强制布局矛盾。**解释**：`forcedStyleAndLayoutDuration` 记的是「浏览器为了让这次读取拿到正确结果，而被迫做的样式重算 + 重排」的时间 —— 这段时间花在浏览器引擎里，**不在 `getBoundingClientRect` 这个函数体内部**。所以：
+
+- `gBCR` 函数自己：0.005ms（只是一个读数）
+- 但它触发的样式重算 + 重排：每次可能几毫秒到几十毫秒
+
+**74 次读写交错 × 每次一次重排 = 上百毫秒**，这就是 78% 的去处。
+
+### (f) 为什么「按住 @」比「按住普通字母」更卡
+
+正常节奏下单键成本 `@` 与 `x` 几乎相同（见 (a) 表与对照实验）。差异出现在**按住不放**（按键连发间隔约 16ms，比一帧还短）：
+
+| 按住连发 10 次 | 长任务帧数 | 总时长 |
+|---|---|---|
+| 普通字母 `x` | **1** | 117ms |
+| `@` | **12** | 1624ms |
+
+原因：打 `x` 只是改文本，React 可以把连续多次更新**合并成一次渲染**；打 `@` 每次都要重算菜单结构（`seedGroups` / `refreshHeaders` / `fetchCandidates`），合并成本高，于是每键都单独占用一个长任务，首尾相接就卡死。
+
+## 3.8 修正 §3.7：gBCR 不是瓶颈，我上一轮归因错了
+
+§3.7 把 78% 的耗时归给 `measure()` 那 74 次 `getBoundingClientRect()`。**这个归因是错的**，本节撤回。
+
+### (a) 反转实验：让 getBoundingClientRect 返回假值
+
+把 `Element.prototype.getBoundingClientRect` 整个替换成返回零尺寸假矩形的函数（**完全不触发任何布局计算**）：
+
+| 配置 | 单次 `@` 到首帧 |
+|---|---|
+| 正常 | 142ms |
+| **gBCR 返回假值（不触发重排）** | **142ms** |
+| 恢复 | 134ms |
+
+**一模一样。** 如果那 75 次 gBCR 真是瓶颈，这里应该快出几十毫秒。所以它们不是。
+
+### (b) 为什么 LoAF 仍报告大量 forcedStyleAndLayout
+
+`forcedStyleAndLayoutDuration` 是**浏览器归给当前这个 script 条目**的样式/布局时间，但它统计的是「这段脚本运行期间，浏览器顺带做的样式与布局工作」——**包括 React 提交阶段的 DOM 变更引发的重算**，不单指 gBCR 读出来的那部分。
+
+我把 gBCR 换成假值后，React 照样改 DOM、照样要重算样式与布局，所以时间不变。
+
+### (c) 真正的拆分（可靠的那部分）
+
+单个 `@` 击键：
+
+| 阶段 | 耗时 | 可信度 |
+|---|---|---|
+| `execCommand` 同步返回 | **4ms** | 高（多次复现） |
+| 同步 → 首帧完成 | **约 135ms** | 高 |
+| 其中：首帧渲染（画） | 约 2ms（LoAF `dur - renderStart`） | 高 |
+| 其中：CSS 动画/过渡 | 约 20ms（禁用动画后 115→95ms 中位数） | 中（波动大） |
+| 其中：其余 = React 渲染 + 样式重算 + 布局 | 约 110ms | 推算，未逐项拆开 |
+
+### (d) 严格键盘对照（唯一可靠的口径）
+
+用真实键盘事件、每轮彻底清空、各 5 轮取中位数：
+
+| 输入 | 中位耗时 | 菜单 |
+|---|---|---|
+| `@`（打开菜单） | **220ms** | 打开 |
+| `x`（普通字符） | **129ms** | 不打开 |
+
+**`@` 比普通字符多约 91ms，这 91ms 就是「打开并渲染 @ 菜单」的成本。**
+
+### (e) 行数不是主要因素
+
+测 `@`（62 行结果）vs `@zzzzzz`（0 行结果）：耗时无稳定差异（132–195ms 交错）。**渲染多少行候选不是瓶颈。**
+
+### (f) 诚实的结论
+
+1. **卡顿确实只在 `@` 上**（严格对照：220ms vs 129ms，多 91ms）。
+2. **不是 gBCR / measure() 的错**（反转实验证明）。
+3. **不是候选行数的错**（0 行也一样慢）。
+4. **不是网络请求的错**（§3.5、§3.6(d) 已证）。
+5. **剩下的是「打开 @ 菜单」这条路径的 React 渲染 + 样式重算 + 布局**，约 91–110ms。**我没能把它再往下拆到具体函数**——因为没有 CDP profiler（isolated 模式）、LoAF 的 forcedStyleAndLayout 又无法归因到具体调用点。
+
+### (g) 关于你截图里那个按钮
+
+你圈的悬浮圆形下箭头 = `button.nArs4W_bottomClose`，aria「折叠底部面板」，`border-radius: 50%`、`position: absolute`。
+
+**它不是 `measure()` 测量的对象。** `measure()` 用的是这两个选择器：
+
+| 选择器 | aria | 位置 |
+|---|---|---|
+| `[data-sidebar-right-expand]` | 打开右侧边栏 | 1560,11 |
+| `[data-sidebar-right-toggle]` | 收起右侧边栏 | 2286,10 |
+
+而 `bottomClose` 的位置是纯 CSS 定的（`computed top:3px; left:1286px`），不经 `measure()`。
+
+**更重要的是**：既然 (a) 已证明 gBCR 不是瓶颈，这个按钮与卡顿无关，不用管它。
+
+## 3.9 CDP 归因与最终更正：实际约 105ms，220ms 是我的测量错误
+
+你指出 220ms 不合理、应该非常流畅——**你是对的**。本轮用 CDP 与更严格的测量重做，结论要第三次更正。
+
+### (a) 220ms 是怎么来的（测量错误）
+
+上一轮我用"真实键盘 + 每轮 `Control+a`/`Delete`/`Backspace×3` 清空 + 等 800ms"，得到 `@` 220ms / `x` 129ms。问题在于：
+
+- 每次清空都触发了完整的一轮"空草稿 → 重新布局"
+- 而且我测的是 `execCommand` **返回到双 rAF 完成**，把清空后的首次重排也算进去了
+- `x` 组因为不打开菜单，React 可以复用上一次的渲染结果，所以显得更快
+
+### (b) 用 LoAF 严格对照（每轮 Escape 关菜单 + 等 1s，各 5 轮）
+
+| 轮次 | `@` 单帧耗时 | `x` 单帧耗时 |
+|---|---|---|
+| 1 | 145ms | 92ms |
+| 2 | 103ms | 97ms |
+| 3 | 125ms | 113ms |
+| 4 | 105ms | 104ms |
+| 5 | 107ms | 103ms |
+| **中位** | **107ms** | **103ms** |
+
+**`@` 与普通字符几乎一样（差 4ms，在噪声内）。**
+
+### (c) 菜单首次打开 vs 已打开（各 4 轮）
+
+| 场景 | 耗时 |
+|---|---|
+| 首次打开 | 133 / 92 / 84 / 101ms |
+| 已打开再打 | 103 / 91 / 147 / 126ms |
+
+**无系统性差异，都在 84–147ms，中位约 105ms。**
+
+### (d) 那 ~105ms 到底是什么
+
+关键时间线（DOM 变更精确打点）：
+
+```
+  6ms   #text 变（插入 @）              ← execCommand 同步返回
+  ↓     138ms 内 DOM 完全无变化          ← 纯 JS，没有排版、没有绘制
+144ms   div.pc3rQa_menu 挂载            ← 菜单 DOM 才出现
+```
+
+并且：
+
+| 观察 | 数值 |
+|---|---|
+| `execCommand` 同步返回 | **2–6ms** |
+| 到下一个宏任务（`MessageChannel`） | **109ms** |
+| 到 rAF | 138ms（静息时 rAF 延迟只有 14ms） |
+| 这期间 fetch 完成数 | **0 个**（`sessions.list` 要 600ms+ 才回） |
+
+**结论：这 ~105ms 是击键后在主线程上连续跑的一段同步 JS，期间 DOM 零变化、请求未返回。**
+
+### (e) 这段同步 JS 不是我们的插件
+
+| 配置 | 菜单挂载时刻 |
+|---|---|
+| 插件全开 | 84–147ms |
+| 插件全停（`__FAST_AT_OFF`） | 53–147ms |
+| 会话候选关（`__FAST_AT_SESSIONS=false`） | 同上量级 |
+
+无系统性差异。
+
+### (f) 为什么一段"什么都不产出"的 JS 要跑 105ms
+
+这是**你的经验判断最正确的地方**。一段不产生 DOM 变更、不等待请求的同步代码跑 105ms，只可能是：
+
+1. **它在做重复计算** —— 比如每次击键都遍历所有候选源、重建分组结构
+2. **它在等 GC** —— 大量临时对象
+3. **它在做深拷贝/深比较** —— 比如对几百个候选做 `filter/map/sort`
+
+我逐一验证过 §3.6 的调用链（`track` → `detectTrigger` → `refreshHeaders` → `fetchCandidates`），这些都是轻量操作，加起来应该 < 5ms。
+
+**所以这 105ms 我目前无法归因到具体函数。** 而 CDP profiler 这条路被挡住了：browser_e2e 用 `--remote-debugging-pipe`（不是端口），外部 playwright 连不进去；自己起浏览器又因 DSH 的 launch token 校验（401）进不了页面。
+
+### (g) 要真正定位，需要你做一件事
+
+给我一个能跑 CDP profiler 的环境，任选其一：
+
+**方案 A（最省事）**：用带调试端口的模式启动 DSH 桌面端（或告诉我 `dsh web` 的 launch URL 带 token 的那种），我直接用 playwright 连上去抓 CPU profile。
+
+**方案 B**：你在 DevTools 里手动抓一次给我 —— 打开 DSH 窗口的 DevTools（`Ctrl+Shift+I`）→ Performance 面板 → 点录制 → 输入一个 `@` → 停止 → 把火焰图截图或导出的 JSON 给我。
+
+**方案 C**：我改 DSH 的启动参数临时加 `--remote-debugging-port=9222`（需要重启客户端）。
+
+有了 profile，我能直接告诉你哪个函数占了多少毫秒、调用栈是什么、该怎么改。
+
+### (h) 本轮已经排除的假设
+
+| 假设 | 验证方式 | 结果 |
+|---|---|---|
+| GC 停顿 | 测 6 轮击键的 `performance.memory` 堆增量 vs 耗时 | 无相关（-0.7MB/154ms、+0.4MB/185ms、-0.1MB/92ms、+0.4MB/72ms）。**排除** |
+| 网络请求 | 击键时打点 `fetch`，记录发起/完成时刻 | 请求 13–14ms 发起，**643ms 内 0 个完成**，而菜单 144ms 就挂载了。**排除** |
+| CSS 动画/过渡 | 注入 `animation:none!important;transition:none!important` | 115→95ms（只省 20ms）。**不是主因** |
+| 首帧渲染（画） | LoAF `duration - renderStart` | 2–6ms/帧。**排除** |
+| `getBoundingClientRect` | 替换成返回零尺寸假值 | 142ms → 142ms。**排除** |
+| 候选行数 | `@`（62 行）vs `@zzzzzz`（0 行） | 无稳定差异。**排除** |
+| 我们的插件 | `__FAST_AT_OFF` / `__FAST_AT_SESSIONS` 三态对照 | 无系统性差异。**排除** |
+
+### (i) 本轮仍在挣扎的几件事（如实记录）
+
+**尝试 1：定位 `slotOccupied`（105 次 gBCR 的来源）**
+
+单次 `@` 击键中 `getBoundingClientRect` 共 113 次，按调用者分：
+
+| 调用者 | 次数 |
+|---|---|
+| `slotOccupied` | **105** |
+| `measure` | 3 |
+| `isVisible` | 3 |
+
+`slotOccupied` 是 `measure()` 里 `slotFree()` 的循环体：每退一步 8px 就调用一次，判断该位置是否被占用。
+
+**尝试 2：短路这 105 次 gBCR**
+
+| 配置 | toMacro |
+|---|---|
+| 正常 | 171ms / 152ms |
+| 短路 slot 相关 gBCR | 129ms / 187ms |
+
+**无显著差异。** 所以这 105 次调用不是主因。（我另外手写复现了 measure 的循环，跑满 200 步要 33–44ms，但那是用 `elementsFromPoint` 的仿写版，比真实实现贵，不能作为证据。）
+
+**尝试 3：GC**
+
+6 轮击键的堆增量 vs 耗时：`-0.7MB/154ms`、`+0.4MB/185ms`、`-0.5MB/139ms`、`-0.1MB/92ms`、`+0.4MB/72ms`、`+0.4MB/106ms`。**无相关。**
+
+### (j) 剩余可能性（需要 profiler 才能确认）
+
+那 ~105ms 是一段**不产生 DOM 变更、不等待请求、无堆增长**的同步 JS。按你的前端经验，这种「空转」最可能的来源是：
+
+1. **重复的深比较/深克隆** —— 比如每次击键都对全量候选做 `JSON.parse(JSON.stringify())` 或深度 diff
+2. **大量的闭包/正则编译** —— 比如每次击键重新创建正则、重新绑定函数
+3. **同步读布局触发的样式重算**（虽是纯 JS 计时，但引擎内部在算）—— 这类在 Performance 面板里会显示为 `Recalculate Style` / `Layout`，**CPU Profiler 抓不到，必须看火焰图**
+
+**第 3 点最符合观测**：DOM 零变化 + 请求未回 + 纯 JS 计时 + LoAF 报 `forcedStyleAndLayout`。而我替换 `getBoundingClientRect` 无效，说明触发点不是它，而是**别的布局读取 API**（`offsetWidth`、`scrollHeight`、`getComputedStyle`、`getClientRects`、`Element.checkVisibility` 等）——我漏测了其中几个。
+
+### (k) 下一步（我能立刻做的）
+
+如果你同意，我可以：
+
+1. **补测所有布局读取 API**（不只是 gBCR）—— 已有明确怀疑对象，不需要 profiler
+2. **用 `--remote-debugging-port` 重启 DSH 桌面端**抓真正的 CPU profile（需要你同意重启）
+3. 在插件里做**防御性优化**：即使根因在 DSH，我也可以让 `computeCandidates` 完全避开任何布局读取，并加防抖减少调用次数
+
+## 3.10 CDP CPU Profiler 定论：热在 Draft.js 的选区恢复，134 次同步布局
+
+你质疑得对，而且**方法也是你给的**：用无头浏览器 + 导出的登录态起带 `--remote-debugging-port` 的 Edge，就能连上 DSH GUI 抓真正的 CPU profile，不需要重启。
+
+### (a) 配置
+
+- `browser_e2e_auth_export` 导出已登录 cookie（1 cookie / 1 origin）
+- playwright `chromium.launch({ channel: 'msedge', args: ['--remote-debugging-port=9222'] })` + `storageState`（headless，窗口不可见）
+- 连上后 `Profiler.enable` + `setSamplingInterval(100)`（0.1ms），6 轮「打一个 @」
+
+### (b) Top 热点（6 轮合计 self time）
+
+| 耗时 | 采样数 | 函数 |
+|---|---|---|
+| **847.6ms** | **1114** | `getBoundingClientRect` (native) |
+| **328.2ms** | **472** | `setBaseAndExtent` (native) |
+| 79.0ms | 94 | `(garbage collector)` |
+| 44.1ms | 63 | `elementsFromPoint` |
+| 25.1ms | 37 | `get` @ index-Ciz7DZxv.js:13 |
+| 24.6ms | 39 | `fetch` (native) |
+| 11.8ms | 16 | `querySelector` |
+
+### (c) gBCR 的调用者（826.8ms 的归属）
+
+| 耗时 | 采样 | 直接调用者 |
+|---|---|---|
+| **826.8ms** | **1091** | **`c` @ index-Ciz7DZxv.js:129:123673** |
+| 10.7ms | 7 | `isVisible` @ :49363（右侧面板状态） |
+| 5.6ms | 8 | `measure` @ :49571 |
+| 3.9ms | 7 | `(anon)` @ :49529（slotOccupied） |
+| 0.6ms | 1 | `jr` |
+
+**`c` 是唯一的热点，占 826.8 / 847.6 = 97.6%。**
+
+### (d) `c` 的身份
+
+`index-Ciz7DZxv.js:129`（`UH` hook）：
+
+```js
+function UH(e, t, r, i = RH) {
+  const [n, o] = x.useState(t)
+  return x.useLayoutEffect(() => {
+    const l = e.current
+    if (l === null) return
+    const c = () => {
+      o(Math.min(t, Math.max(0, l.getBoundingClientRect().bottom - B2(i))))
+    }
+    return c(),
+      window.addEventListener('resize', c),
+      window.addEventListener('scroll', c, true),
+      () => { /* 卸载时移除 */ }
+  }, [e, t, r, i]), n
+}
+
+function B2(e, t, r = 0) {
+  const i = document.documentElement
+  const n = Number.parseFloat(getComputedStyle(i).getPropertyValue('--dsh-frame-top-clearance'))
+  ...
+}
+```
+
+一个「测量某元素 bottom 距视口顶部多少」的 hook，用来算浮层/菜单的可用高度。
+
+### (e) 单次击键的真实调用次数
+
+| 观测 | 数值 |
+|---|---|
+| 一次 `@` 击键 `getBoundingClientRect` 总调用 | **134 次** |
+| 单次 gBCR 耗时（静息） | 0.1ms |
+| 单次 gBCR 耗时（击键后立刻） | 0–0.4ms |
+| 击键到下一个宏任务 | 97ms |
+
+**前几个调用栈全部是：**
+
+```js
+getBoundingClientRect
+  <- (anon) @ /plugins/:2644
+  <- jr      @ /plugins/:2644
+  <- (anon) @ /plugins/:2646
+```
+
+### (f) `jr` 的身份：Draft.js 的 `setSelection`
+
+```js
+function jr(t, e, n, o, r, s) {        // t=prevSelection, e=nextSelection, n=inputState
+  ...
+  const [, p] = Hr(n, h, f.offset)       // 把 Draft 偏移量映射到 DOM 节点+offset
+  const [, m] = Hr(n, g, d.offset)
+  ...
+  if (Ur(o, v, p, T, m), ...)             // Ur 里调 setBaseAndExtent
+}
+```
+
+`jr` 是 Draft.js 每次输入后**恢复 DOM 选区**的函数。它要：
+
+1. 用 `Hr` 把 Draft 的字符偏移量映射回 DOM 节点（遍历叶子节点）
+2. 用 `Ur` → `setBaseAndExtent` 真正设置选区（另一个 328ms 热点）
+3. 期间反复用 `getBoundingClientRect` 判断可见性/滚动位置
+
+**134 次 gBCR 就是「每次输入后重新定位光标」的代价。**
+
+### (g) 为什么它本不该这么慢——你的判断成立
+
+正常输入一个字符应该是 1–2ms，这里是 ~100ms。原因链条：
+
+1. **Draft.js 的选区恢复是 O(叶子节点数)**。`@` 打开菜单时 DOM 里多了几十个候选行，`Hr` 遍历的叶子节点数量暴涨
+2. **每次 gBCR 都是同步布局读**。只要前面有 DOM 写入（React 刚提交完），读取就强制 `Layout`
+3. **134 次读，每次之间可能夹着写** → 反复触发完整重排
+
+这也解释了 §3.8 那个实验为什么翻车：我把 gBCR 换成假值后 `Hr` 提前返回，遍历次数从 134 掉到个位数——**把要测的东西测没了**。
+
+### (h) 可以做但没做的优化（等你决定）
+
+| 优化 | 改哪里 | 预期 | 风险 |
+|---|---|---|---|
+| **候选行虚拟化** | `@` 菜单列表只渲染可见行 | 候选行 62 → ~8，`Hr` 遍历量降 8 倍 | 中，要改菜单组件 |
+| **菜单打开时不重设选区** | `controller.ts` 里 `@` 那一路跳过 selection 恢复 | 省掉整条 `jr` 链 | 高，可能破坏光标位置 |
+| **`UH` 的 `c()` 改用 Observer** | 用 `ResizeObserver` + `IntersectionObserver` 替代主动读 | 消除同步布局 | 低，但属于改 DSH 核心 |
+| **插件侧降候选数量上限** | 我们插件控制返回的 rows 数 | 候选 62 → 20，按比例降 | **低，我能立刻做** |
+
+### (i) 诚实的边界
+
+- §3.9 我说「105ms 归因不了」是错的。**现在归因到了：97.6% 是 `UH` hook 里的 `c()` → 134 次 `getBoundingClientRect`，触发方是 Draft.js 的 `jr`（setSelection）。**
+- 「134 次」依赖 DOM 里候选行的数量。菜单关闭时打普通字母，同一套 `jr` 也会跑，只是叶子节点少得多。
+- 我没有改动 DSH 或插件去「验证优化有效」，因为那超出了「归因」的范围。第 4 行（插件侧降候选数）是唯一不动 DSH 核心就能做的。
+
+### (j) 候选行数的影响（实测追加）
+
+同一台机器、同一页面，交替打 `@`（菜单有内容）与 `@zzzzzz`（菜单空）：
+
+| 查询 | toMacro | gBCR 次数 | 菜单节点数 |
+|---|---|---|---|
+| `@` | 98ms | 134 | 13 |
+| `@zzzzzz` | 67ms | 78 | 0 |
+| `@` | 167ms | 114 | 8 |
+| `@zzzzzz` | 70ms | 113 | 0 |
+
+**菜单有内容时约 98–167ms / 114–134 次；菜单空时约 67–70ms / 78–113 次。**
+
+有相关性，但降幅不是 8 倍——因为菜单关闭时 `jr` 仍要经 `Hr` 遍历编辑器里的文本节点。**这意味着「插件侧降候选数」只能拿到约 30% 的改善，不是数量级的。**
+
+我前面在 (h) 表里把「插件侧降候选数」的收益写乐观了，这里更正：**约 20–30%，不是按行数线性降。**
+## 4. 建议（供你决策，我没有擅自实施）
+
+按实测数据，优先级从高到低：
+
+> 先看 §3.6(g)：**插件层面无法显著改善「按住 @ 卡顿」**，因为 116ms 是 DSH 侧同步开销。下表是在此前提下仍可选的措施。
+
+| 措施 | 预期收益 | 依据 | 能否解决「按住 @ 卡顿」 |
+|---|---|---|---|
+| **1. 防抖** | 省掉重复的候选计算 | §3.6(g) | **收益很小**（116ms 里候选计算占比小） |
+| **2. 同 query 缓存** | 无 | §3.6(g) 连打 @ 时 query 每次都变 | **无效** |
+| **3. 方案 A（只文件）** | 首屏 1727→226ms | §2.1 | **不能**（只改善首屏） |
+| **4. Rust 换 JS** | 无性能收益（差 10%），但省掉 exe 与子进程 | §3.2 | 不能 |
+| **5. 修 DSH 输入触发器** | 根治 | §3.6 卡顿源在 controller.track() 的同步块 | 能，但超出插件范围 |
+
+**我的建议（按实测）**：
+
+- **卡顿**：插件层面没有有效手段，需要改 DSH 的输入触发器。可考虑的上游改法：query 为纯符号（如 `@@@`）时不打开菜单；或对连续同字符输入做合并。
+- **首屏**：若你更在意「按下 @ 到菜单出现」的速度，方案 A（只文件）能把 1727ms 降到 226ms，但会失去会话候选功能。
+- **Rust**：从性能看没有理由继续用（只快 10%）。继续用 Rust 唯一的好处是不占主线程，但 **JS worker 同样不占**。若你想简化，换成 worker 里的 JS 完全够用。
+- 这轮我按你的要求只出报告，没有改代码方案。
+
+## 5. 未验证 / 局限
+
+| 项 | 说明 |
+|---|---|
+| 测量期间系统负载波动大 | CPU 在 38%–100% 之间跳，同一配置多次采样差异可达 3 倍。三组对照是交叉测的，趋势可信，绝对值有噪声 |
+| JS 全量索引未直接测 | 只测了 20 会话的解析对比；全量 JS 是外推值 |
+| 「方案 A 流畅」的判定 | 实测未达流畅（长任务 42 个），所以按你的条件（「如果第二条流畅」）本不该做第三条；但第三条是独立的解析对比，仍做了 |
+| 防抖/缓存的实际收益 | **未实施，因此未实测**。我实测的只是「合并重复请求」（无效），真正的「击键阶段防抖」还没做，§4 表里「能解决」是**基于长任务归因的推断，不是实测**——如果要采纳，需要实施后重测确认 |
+| 我的诊断开关改动 | 为做这轮测量，我在 `client.js` 加了两个诊断开关（`__FAST_AT_OFF` / `__FAST_AT_SESSIONS`），默认行为与之前完全一致。它们已同步到 profile，但没有纳入正式测试 |
