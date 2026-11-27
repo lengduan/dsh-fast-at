@@ -133,23 +133,30 @@ T1 本地会话索引  →  T2 客户端快照  →  T3 空数组
 
 ## 安装
 
-本插件是纯 JS，**不需要编译任何二进制**，也没有 `cargo` / Rust 工具链依赖。
-
-从 GitHub 子目录安装（`<sha>` 取本仓当前 HEAD；pwsh / bash 下 `#` 与 `&` 是保留字符，
-spec 必须整体加引号）：
+本插件已发布到 npm，安装与更新都走 npm，不再 link 本地仓库。
+纯 JS，**不需要编译任何二进制**，也没有 `cargo` / Rust 工具链依赖。
 
 ```sh
-dsh plugin --profile desktop add 'github:lengduan/my-dsh-plugins#path:dsh-fast-at&<sha>'
+dsh plugin --profile desktop add dsh-fast-at@0.2.1
 ```
 
-本地联调也可以用 link：
+更新到新版本：
 
 ```sh
-dsh plugin --profile desktop add 'dsh-fast-at@link:C:\lengduan\githubs\my-dsh-plugins\dsh-fast-at'
+dsh plugin --profile desktop add dsh-fast-at@<新版本>
 ```
 
 > **装完必须重启 DSH 桌面客户端。** 浏览器半的改动可以热加载，
 > 但 host 半的路由注册（`ctx.webServer.register`）只在启动时装配。
+
+本地开发联调（改源码即时生效，不是日常安装方式）用 link：
+
+```sh
+dsh plugin --profile desktop add 'dsh-fast-at@link:C:\lengduan\githubs\dsh-fast-at'
+```
+
+> 从 link 切回 npm 版本前先 `remove_bundle` 并删掉 `node_modules/dsh-fast-at` 的 junction，
+> 否则 pnpm 装包会报 `EPERM: operation not permitted, rename ... dsh-fast-at`。
 
 ## 卸载
 
@@ -229,24 +236,3 @@ const INDEX_ENABLED = false   // 完全回到客户端快照实现
 
 阅读顺序与注意事项见 [docs/索引.md](docs/索引.md)。
 
-## 安装
-
-插件以本地 junction 方式挂进 profile，改完源码即时生效（HMR）：
-
-```powershell
-git clone https://github.com/lengduan/dsh-fast-at.git C:\lengduan\githubs\dsh-fast-at
-$link = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-fast-at"
-cmd /c mklink /J "$link" "C:\lengduan\githubs\dsh-fast-at"
-```
-
-之后在 DSH 的插件面板启用 `dsh-fast-at`（条目 id：`include:fast-at`）。
-
-## 测试
-
-```powershell
-git clone https://github.com/lengduan/dsh-fast-at.git
-cd dsh-fast-at
-node tests/all.mjs
-```
-
-6 个套件、190 项断言，不依赖 DSH 运行时。
