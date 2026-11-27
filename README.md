@@ -33,7 +33,7 @@
 客户端快照只包含「侧栏已加载」的会话，而磁盘上有全量数百个。用户要「按会话文件修改时间
 取最新 20 条」，只有读磁盘才准确。
 
-`dsh-fast-at/lib/sessions-reader.js`（host 侧唯一碰磁盘的模块，**纯 JS，无子进程**）
+`lib/sessions-reader.js`（host 侧唯一碰磁盘的模块，**纯 JS，无子进程**）
 扫 `~/.dsh/sessions`：
 
 - **只解第一帧**取 header（实测第一帧 max 245 字节，不必读最大 782KB 的整个文件）
@@ -202,6 +202,28 @@ node tests/check-live.mjs         # 重启 DSH 后验证 /fast-at/api 路由
 不用卸载，改一个常量：
 
 ```js
-// dsh-fast-at/lib/client.js
+// lib/client.js
 const INDEX_ENABLED = false   // 完全回到客户端快照实现
 ```
+
+## 安装
+
+插件以本地 junction 方式挂进 profile，改完源码即时生效（HMR）：
+
+```powershell
+git clone https://github.com/lengduan/dsh-fast-at.git C:\lengduan\githubs\dsh-fast-at
+$link = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-fast-at"
+cmd /c mklink /J "$link" "C:\lengduan\githubs\dsh-fast-at"
+```
+
+之后在 DSH 的插件面板启用 `dsh-fast-at`（条目 id：`include:fast-at`）。
+
+## 测试
+
+```powershell
+git clone https://github.com/lengduan/dsh-fast-at.git
+cd dsh-fast-at
+node tests/all.mjs
+```
+
+6 个套件、190 项断言，不依赖 DSH 运行时。
