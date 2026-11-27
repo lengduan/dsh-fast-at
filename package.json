@@ -1,6 +1,6 @@
 {
   "name": "dsh-fast-at",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "去掉 @ 引用候选的 2 秒等待：会话候选改由本地会话索引提供（纯 JS，按会话文件修改时间取最新 20 条），失败回退客户端快照；文件候选由插件自取以保持原生语义",
   "type": "module",
   "main": "lib/index.js",
